@@ -1,5 +1,5 @@
 --[[
-    RIVALS - owl build v11
+    RIVALS - owl build v12
     black theme, grouped sections, silent aim, wall walk, panic switch
 --]]
 
@@ -362,7 +362,7 @@ new("TextLabel", {
     Position = UDim2.fromOffset(92, 0),
     BackgroundTransparency = 1,
     Font = FONT,
-    Text = "owl v11",
+    Text = "owl v12",
     TextColor3 = Theme.dim,
     TextSize = 11,
     TextXAlignment = Enum.TextXAlignment.Left,
@@ -1282,20 +1282,37 @@ restoreCollide = function()
     savedForChar = nil
 end
 
-local function stripCollide(char)
+local function stripCollide(char, hrp, hrpSolid)
     for _, part in ipairs(char:GetDescendants()) do
         if part:IsA("BasePart") then
             if savedCollide[part] == nil then
                 savedCollide[part] = part.CanCollide
             end
-            part.CanCollide = false
+            if part == hrp then
+                -- the root stays solid most of the time so the Humanoid keeps a
+                -- floor contact - no floor means no jump, no jumppad
+                part.CanCollide = hrpSolid
+            else
+                part.CanCollide = false
+            end
         end
     end
 end
 
 -- Keeps the character on the ground with collisions off, so walls are walkable
 -- without dropping through the floor.
-local function stickFloor(char, hrp)
+local function stickFloor(char, hrp, hum)
+    if hum then
+        local state = hum:GetState()
+        if state == Enum.HumanoidStateType.Jumping
+            or state == Enum.HumanoidStateType.Freefall
+            or state == Enum.HumanoidStateType.FallingDown then
+            return
+        end
+    end
+    local vel = hrp.AssemblyLinearVelocity
+    if vel.Y > 0.5 then return end
+
     local ignore = { char }
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LP and plr.Character then table.insert(ignore, plr.Character) end
@@ -1312,15 +1329,17 @@ local function stickFloor(char, hrp)
     local spin = hrp.CFrame - hrp.CFrame.Position
     pcall(function()
         hrp.CFrame = CFrame.new(hrp.Position.X, targetY, hrp.Position.Z) * spin
-        local vel = hrp.AssemblyLinearVelocity
         hrp.AssemblyLinearVelocity = Vector3.new(vel.X, 0, vel.Z)
     end)
 end
+
+local hrpGhostUntil = 0
 
 local function updateMovement()
     local char = LP.Character
     if not char then
         if savedForChar then restoreCollide() end
+        hrpGhostUntil = 0
         return
     end
 
@@ -1329,6 +1348,7 @@ local function updateMovement()
 
     if not (walk or free) then
         if savedForChar then restoreCollide() end
+        hrpGhostUntil = 0
         return
     end
 
@@ -1339,9 +1359,30 @@ local function updateMovement()
     local hrp = char:FindFirstChild("HumanoidRootPart")
     if not hum or not hrp then return end
 
-    stripCollide(char)
-    if walk and not free then
-        stickFloor(char, hrp)
+    if free then
+        stripCollide(char, hrp, false)
+        return
+    end
+
+    -- wall walk: ghost the root only while actually pushing into geometry, so
+    -- the Humanoid keeps its floor contact (jump input and jumppads need it)
+    local now = os.clock()
+    if hum.MoveDirection.Magnitude > 0.1 then
+        local ignore = { char }
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr.Character and plr.Character ~= char then
+                table.insert(ignore, plr.Character)
+            end
+        end
+        moveParams.FilterDescendantsInstances = ignore
+        local hit = Workspace:Raycast(hrp.Position, hum.MoveDirection * 3.5, moveParams)
+        if hit then hrpGhostUntil = now + 0.2 end
+    end
+
+    local ghosted = now <= hrpGhostUntil
+    stripCollide(char, hrp, not ghosted)
+    if ghosted then
+        stickFloor(char, hrp, hum)
     end
 end
 
@@ -2238,7 +2279,7 @@ ENV.__rivalsOwl = {
     panic   = panic,
 }
 
-print("[rivals-owl] v11 loaded - menu: " .. Cfg.menuKey.Name
+print("[rivals-owl] v12 loaded - menu: " .. Cfg.menuKey.Name
     .. " | tabs: " .. tostring(#TabOrder)
     .. " | drawing: " .. tostring(DRAW_SUPPORTED)
     .. " | hook: " .. tostring(HOOK_SUPPORTED))
