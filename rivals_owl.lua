@@ -1,5 +1,5 @@
 --[[
-    RIVALS - owl build v12
+    RIVALS - owl build v14
     black theme, grouped sections, silent aim, wall walk, panic switch
 --]]
 
@@ -92,6 +92,10 @@ local Cfg = {
         debugRemotes = false,
         godmode     = false,
         noHitbox    = false,
+        fly         = false,
+        flySpeed    = 60,
+        expandHitbox = false,
+        hitboxSize  = 6,
     },
 }
 
@@ -362,7 +366,7 @@ new("TextLabel", {
     Position = UDim2.fromOffset(92, 0),
     BackgroundTransparency = 1,
     Font = FONT,
-    Text = "owl v12",
+    Text = "owl v14",
     TextColor3 = Theme.dim,
     TextSize = 11,
     TextXAlignment = Enum.TextXAlignment.Left,
@@ -943,10 +947,14 @@ local ValueMap = {
     ["Wall Shoot|Debug remote names"] = function() return Cfg.hacks.debugRemotes end,
     ["Wall Shoot|Aimbot ignores walls"] = function() return not Cfg.aim.wallCheck end,
     ["Wall Shoot|Wall walk"]     = function() return Cfg.hacks.wallWalk end,
+    ["Wall Shoot|Expand target hitbox"] = function() return Cfg.hacks.expandHitbox end,
+    ["Wall Shoot|Hitbox size"]   = function() return Cfg.hacks.hitboxSize end,
     ["Wall Shoot|Noclip (free fall)"] = function() return Cfg.hacks.noclip end,
 
     ["Misc|Fullbright"]          = function() return Cfg.hacks.fullbright end,
     ["Misc|Camera FOV"]          = function() return Cfg.hacks.camFov end,
+    ["Misc|Fly (Space toggle)"]  = function() return Cfg.hacks.fly end,
+    ["Misc|Fly speed"]           = function() return Cfg.hacks.flySpeed end,
 
     ["Settings|Menu key"]        = function() return Cfg.menuKey end,
     ["Settings|UI scale"]        = function() return math.floor(Cfg.uiScale * 100) end,
@@ -993,7 +1001,9 @@ end
 -- notifications
 -- ============================================================
 
-local function notify(text)
+local function notify(text, duration)
+    local life = tonumber(duration) or 2.2
+    if life < 0.5 then life = 0.5 end
     local box = new("Frame", {
         Size = UDim2.new(1, -28, 0, 30),
         Position = UDim2.new(0, 14, 1, 14),
@@ -1031,7 +1041,7 @@ local function notify(text)
     tw(box, { Position = UDim2.new(0, 14, 1, -46), BackgroundTransparency = 0.04 }, 0.24)
     tw(lbl, { TextTransparency = 0 }, 0.24)
 
-    task.delay(2.2, function()
+    task.delay(life, function()
         tw(box, { Position = UDim2.new(0, 14, 1, 14), BackgroundTransparency = 1 }, 0.2)
         tw(lbl, { TextTransparency = 1 }, 0.2)
         task.delay(0.3, function()
@@ -1045,7 +1055,7 @@ end
 -- ============================================================
 
 -- forward declarations: UI callbacks below run long after these locals exist
-local restoreCollide, applyFullbright, panic, destroy
+local restoreCollide, applyFullbright, panic, destroy, clearAllExpanders
 
 local ConfigTab  = makeTab("Config", 1)
 local EspTab     = makeTab("ESP", 2)
@@ -1158,6 +1168,11 @@ toggle(WallTab, "Silent aim (wall shoot)", Cfg.hacks.silent, function(v)
 end)
 slider(WallTab, "Silent FOV", 40, 600, Cfg.hacks.silentFov, 0, function(v) Cfg.hacks.silentFov = v end)
 toggle(WallTab, "Aim head", Cfg.hacks.aimHead, function(v) Cfg.hacks.aimHead = v end)
+toggle(WallTab, "Expand target hitbox", Cfg.hacks.expandHitbox, function(v)
+    Cfg.hacks.expandHitbox = v
+    notify(v and "target hitbox expanded" or "hitbox normal")
+end)
+slider(WallTab, "Hitbox size", 2, 24, Cfg.hacks.hitboxSize, 0, function(v) Cfg.hacks.hitboxSize = v end)
 toggle(WallTab, "Debug remote names", Cfg.hacks.debugRemotes, function(v) Cfg.hacks.debugRemotes = v end)
 toggle(WallTab, "Aimbot ignores walls", not Cfg.aim.wallCheck, function(v)
     Cfg.aim.wallCheck = not v
@@ -1190,6 +1205,13 @@ slider(MiscTab, "Camera FOV", 40, 120, Cfg.hacks.camFov, 0, function(v)
     local cam = Workspace.CurrentCamera
     if cam then cam.FieldOfView = v end
 end)
+
+sectionHeader(MiscTab, "movement")
+toggle(MiscTab, "Fly (Space toggle)", Cfg.hacks.fly, function(v)
+    Cfg.hacks.fly = v
+    notify(v and "fly on - space again to land" or "fly off")
+end)
+slider(MiscTab, "Fly speed", 10, 200, Cfg.hacks.flySpeed, 0, function(v) Cfg.hacks.flySpeed = v end)
 
 sectionHeader(MiscTab, "interface")
 button(MiscTab, "Disable everything", Theme.panelAlt, function()
@@ -1335,10 +1357,98 @@ end
 
 local hrpGhostUntil = 0
 
+-- ============================================================
+-- flight: space toggles, camera relative WASD, Q/E for altitude
+-- ============================================================
+
+local flyChar    = nil
+local flyEngaged = false
+local flyMasterPrev = false
+
+local function stopFly(char, hum)
+    flyEngaged = false
+    if not (char and hum) then return end
+    pcall(function()
+        hum.PlatformStand = false
+        if hum.Health > 0 then
+            hum:ChangeState(Enum.HumanoidStateType.Freefall)
+        end
+    end)
+end
+
+local function updateFly(dt)
+    local master = Cfg.hacks.fly and true or false
+    if master and not flyMasterPrev then
+        flyEngaged = true            -- toggling the menu switch lifts you at once
+    elseif not master then
+        flyEngaged = false
+    end
+    flyMasterPrev = master
+
+    local char = LP.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+
+    if not (char and hum and hrp and hum.Health > 0) then
+        flyEngaged = false
+        flyChar = nil
+        return
+    end
+
+    if not (master and flyEngaged) then
+        if flyChar then stopFly(char, hum) end
+        flyChar = nil
+        return
+    end
+
+    if flyChar and flyChar ~= char then
+        -- respawned mid flight: the old humanoid is gone, start clean
+        flyEngaged = true
+    end
+    flyChar = char
+    flyEngaged = true
+
+    pcall(function() hum.PlatformStand = true end)
+
+    local cam = Workspace.CurrentCamera
+    local move = Vector3.new(0, 0, 0)
+    if cam then
+        local look  = cam.CFrame.LookVector
+        local right = cam.CFrame.RightVector
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then move = move + look end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then move = move - look end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D) then move = move + right end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A) then move = move - right end
+        if UserInputService:IsKeyDown(Enum.KeyCode.E) then move = move + Vector3.new(0, 1, 0) end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Q) then move = move - Vector3.new(0, 1, 0) end
+    end
+
+    local speed = math.clamp(tonumber(Cfg.hacks.flySpeed) or 60, 5, 300)
+    local step  = math.clamp(tonumber(dt) or 0, 0, 0.1)
+
+    pcall(function()
+        -- zero velocity kills gravity, the CFrame step is the actual travel
+        hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        if move.Magnitude > 0.01 then
+            hrp.CFrame = hrp.CFrame + move.Unit * speed * step
+        end
+    end)
+end
+
 local function updateMovement()
     local char = LP.Character
     if not char then
         if savedForChar then restoreCollide() end
+        hrpGhostUntil = 0
+        return
+    end
+
+    if Cfg.hacks.fly and flyEngaged then
+        -- flight owns the character; leave collisions solid so landing is clean
+        if savedForChar then
+            restoreCollide()
+            savedForChar = nil
+        end
         hrpGhostUntil = 0
         return
     end
@@ -1445,6 +1555,15 @@ panic = function()
     Cfg.hacks.fullbright = false
     Cfg.hacks.godmode = false
     Cfg.hacks.noHitbox = false
+    Cfg.hacks.fly = false
+    flyEngaged = false
+    Cfg.hacks.expandHitbox = false
+    clearAllExpanders()
+    do
+        local char = LP.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if char and hum then stopFly(char, hum) end
+    end
     aimActive = false
     aimToggleState = false
     restoreCollide()
@@ -1896,12 +2015,26 @@ track(UserInputService.InputEnded:Connect(function(input)
     end
 end))
 
+-- space toggles flight, but only while the Misc master switch is armed so a
+-- normal jump is never eaten when the feature is off
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode ~= Enum.KeyCode.Space then return end
+    if not Cfg.hacks.fly then return end
+    local char = LP.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not (hum and hum.Health > 0) then return end
+    flyEngaged = not flyEngaged
+    notify(flyEngaged and "fly on - space to land" or "fly off - space to fly")
+end))
+
 -- ============================================================
 -- silent aim: rewrite fire arguments to the target head
 -- ============================================================
 
 local silentTargetPos = nil
 local silentTargetPart = nil
+local silentTargetPlayer = nil
 local hookRestore = nil
 local restoreNamecall = nil
 
@@ -1909,6 +2042,7 @@ local function updateSilentTarget()
     if not Cfg.hacks.silent then
         silentTargetPos = nil
         silentTargetPart = nil
+        silentTargetPlayer = nil
         return
     end
     local plr = findTarget(Cfg.hacks.silentFov, true, Cfg.hacks.aimHead)
@@ -1918,9 +2052,88 @@ local function updateSilentTarget()
     if part then
         silentTargetPos = predictPos(plr, part)
         silentTargetPart = part
+        silentTargetPlayer = plr
     else
         silentTargetPos = nil
         silentTargetPart = nil
+        silentTargetPlayer = nil
+    end
+end
+
+-- Hitbox resolver: a welded invisible box on the target enlarges the geometry
+-- your client raycasts against, so shots that graze the model still register.
+local expanders = {}
+
+local function clearExpander(plr)
+    local p = expanders[plr]
+    expanders[plr] = nil
+    if p and p.Parent then
+        pcall(function() p:Destroy() end)
+    end
+end
+
+clearAllExpanders = function()
+    for plr in pairs(expanders) do
+        local p = expanders[plr]
+        expanders[plr] = nil
+        if p and p.Parent then pcall(function() p:Destroy() end) end
+    end
+    expanders = {}
+end
+
+local expanderAt = 0
+
+local function updateHitboxExpander()
+    if not Cfg.hacks.expandHitbox or not Cfg.hacks.silent then
+        if next(expanders) then clearAllExpanders() end
+        return
+    end
+    local now = os.clock()
+    if now - expanderAt < 0.15 then return end
+    expanderAt = now
+
+    local plr = silentTargetPlayer
+    if not plr then
+        if next(expanders) then clearAllExpanders() end
+        return
+    end
+
+    local char = plr.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        clearExpander(plr)
+        return
+    end
+
+    local size = math.clamp(tonumber(Cfg.hacks.hitboxSize) or 6, 2, 24)
+    local p = expanders[plr]
+
+    if p and p.Parent == char then
+        if p.Size ~= Vector3.new(size, size, size) then
+            pcall(function() p.Size = Vector3.new(size, size, size) end)
+        end
+    else
+        clearExpander(plr)
+        p = Instance.new("Part")
+        p.Name = "__owl_hitbox"
+        p.Size = Vector3.new(size, size, size)
+        p.Transparency = 1
+        p.CanCollide = false
+        p.CanTouch = false
+        p.CanQuery = true
+        p.Massless = true
+        p.Anchored = false
+        p.Parent = char
+        local weld = Instance.new("WeldConstraint")
+        weld.Part0 = p
+        weld.Part1 = hrp
+        weld.Parent = p
+        expanders[plr] = p
+    end
+
+    -- drop expanders for anyone who stopped being the target
+    for other in pairs(expanders) do
+        if other ~= plr then clearExpander(other) end
     end
 end
 
@@ -1934,12 +2147,17 @@ if HOOK_SUPPORTED then
         return head and head.Position or Vector3.new(0, 0, 0)
     end
 
-    local lastLoggedRemote = nil
+    local lastLog = {}
 
     local namecall
     local ok = pcall(function()
         namecall = hookmetamethod(game, "__namecall", function(self, ...)
-            local method = getnamecallmethod()
+            -- an executor without getnamecallmethod must not turn every namecall
+            -- into an error; fall straight through to the original
+            local okMethod, method = pcall(getnamecallmethod)
+            if not okMethod or type(method) ~= "string" then
+                return namecall(self, ...)
+            end
             if Cfg.hacks.godmode and (method == "TakeDamage" or method == "BreakJoints") then
                 local own = false
                 pcall(function()
@@ -1947,6 +2165,39 @@ if HOOK_SUPPORTED then
                 end)
                 if own then return end
             end
+
+            -- camera ray helpers: shoot code that builds its ray from the camera
+            -- gets a ray pointed straight at the silent target
+            if Cfg.hacks.silent and silentTargetPos
+                and (method == "ScreenPointToRay" or method == "ViewportPointToRay") then
+                local cam = Workspace.CurrentCamera
+                if cam then
+                    local origin = cam.CFrame.Position
+                    local dir = silentTargetPos - origin
+                    if dir.Magnitude > 0.001 then
+                        return Ray.new(origin, dir.Unit * 2000)
+                    end
+                end
+            end
+
+            -- legacy hit detection: (part, position, normal) is cheap to fake,
+            -- so old FindPartOnRay shooters can be redirected through walls
+            if Cfg.hacks.silent and silentTargetPart and silentTargetPos
+                and (method == "FindPartOnRay"
+                    or method == "FindPartOnRayWithIgnoreList"
+                    or method == "FindPartOnRayWithWhitelist") then
+                local ray = ...
+                if typeof(ray) == "Ray" then
+                    local len = ray.Direction.Magnitude
+                    local toTarget = silentTargetPos - ray.Origin
+                    if len > 20 and toTarget.Magnitude > 0.001
+                        and ray.Direction.Unit:Dot(toTarget.Unit) > 0.85 then
+                        return silentTargetPart, silentTargetPos,
+                            (ray.Origin - silentTargetPos).Unit
+                    end
+                end
+            end
+
             if Cfg.hacks.silent and silentTargetPos
                 and (method == "FireServer" or method == "InvokeServer") then
                 local remoteName = ""
@@ -1963,29 +2214,38 @@ if HOOK_SUPPORTED then
                 end
 
                 local target = silentTargetPos
-                local origin = shotOrigin()
+                local originRef = shotOrigin()
                 local args = table.pack(...)
                 local changed = false
+                local remoteLooksLikeShot = false
+
                 for i = 1, args.n do
                     local v = args[i]
                     local ty = typeof(v)
                     if ty == "Vector3" then
-                        -- short vectors are directions, long ones are world positions
-                        if v.Magnitude <= 4 then
-                            local dir = target - origin
+                        remoteLooksLikeShot = true
+                        if v.Magnitude <= 6 then
+                            -- short vector: a fire direction, keep its length
+                            local dir = target - originRef
                             if dir.Magnitude > 0.001 then
                                 args[i] = dir.Unit * v.Magnitude
                             else
                                 args[i] = target
                             end
-                        else
+                            changed = true
+                        elseif (v - originRef).Magnitude > 10 then
+                            -- far from the shooter: a hit or impact position
                             args[i] = target
+                            changed = true
                         end
-                        changed = true
+                        -- anything within 10 studs of the camera is the muzzle
+                        -- origin; rewriting it gets the whole shot rejected
                     elseif ty == "CFrame" then
+                        remoteLooksLikeShot = true
                         args[i] = CFrame.lookAt(v.Position, target)
                         changed = true
                     elseif ty == "Ray" then
+                        remoteLooksLikeShot = true
                         local dir = target - v.Origin
                         if dir.Magnitude > 0.001 then
                             args[i] = Ray.new(v.Origin, dir)
@@ -1997,8 +2257,8 @@ if HOOK_SUPPORTED then
                         for k, inner in pairs(v) do
                             local it = typeof(inner)
                             if it == "Vector3" then
-                                local dir = target - origin
-                                v[k] = inner.Magnitude <= 4
+                                local dir = target - originRef
+                                v[k] = inner.Magnitude <= 6
                                     and (dir.Magnitude > 0.001 and (dir.Unit * inner.Magnitude) or target)
                                     or target
                                 touched = true
@@ -2010,21 +2270,30 @@ if HOOK_SUPPORTED then
                                 touched = true
                             end
                         end
-                        if touched then changed = true end
+                        if touched then
+                            changed = true
+                            remoteLooksLikeShot = true
+                        end
                     elseif ty == "Instance" and silentTargetPart and v:IsA("BasePart") then
                         -- bare part argument: only swap parts that belong to a player
                         local model = v:FindFirstAncestorOfClass("Model")
                         if model and Players:GetPlayerFromCharacter(model) then
                             args[i] = silentTargetPart
                             changed = true
+                            remoteLooksLikeShot = true
                         end
                     end
                 end
-                if changed then
-                    if Cfg.hacks.debugRemotes and remoteName ~= lastLoggedRemote then
-                        lastLoggedRemote = remoteName
-                        notify("wall shoot -> " .. remoteName, 2)
+
+                if Cfg.hacks.debugRemotes and remoteLooksLikeShot then
+                    local now = os.clock()
+                    if not lastLog[remoteName] or now - lastLog[remoteName] > 1 then
+                        lastLog[remoteName] = now
+                        notify("remote " .. remoteName .. (changed and " -> rewritten" or " (no args matched)"), 2)
                     end
+                end
+
+                if changed then
                     return namecall(self, table.unpack(args, 1, args.n))
                 end
             end
@@ -2043,7 +2312,9 @@ if HOOK_SUPPORTED then
 
     -- mouse level: games that read mouse.Hit / mouse.UnitRay get a target-locked value
     pcall(function()
-        if type(newcclosure) ~= "function" or type(setreadonly) ~= "function" then
+        if type(newcclosure) ~= "function"
+            or type(setreadonly) ~= "function"
+            or type(isreadonly) ~= "function" then
             return
         end
         local mt = getrawmetatable(game)
@@ -2118,6 +2389,8 @@ track(RunService.RenderStepped:Connect(function(dt)
     pcall(updateESP)
     pcall(applyAim, dt)
     pcall(updateSilentTarget)
+    pcall(updateHitboxExpander)
+    pcall(updateFly, dt)
     pcall(updateMovement)
     pcall(updateGodmode)
     pcall(updateHitboxProtection)
@@ -2233,6 +2506,15 @@ destroy = function()
     Cfg.hacks.noclip = false
     Cfg.hacks.godmode = false
     Cfg.hacks.noHitbox = false
+    Cfg.hacks.fly = false
+    flyEngaged = false
+    Cfg.hacks.expandHitbox = false
+    clearAllExpanders()
+    do
+        local char = LP.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if char and hum then stopFly(char, hum) end
+    end
     aimActive = false
     aimToggleState = false
     silentTargetPos = nil
@@ -2263,6 +2545,8 @@ destroy = function()
         if plr.Character then
             local hl = plr.Character:FindFirstChild("__owl_chams")
             if hl then pcall(function() hl:Destroy() end) end
+            local hb = plr.Character:FindFirstChild("__owl_hitbox")
+            if hb then pcall(function() hb:Destroy() end) end
         end
     end
 
@@ -2279,7 +2563,7 @@ ENV.__rivalsOwl = {
     panic   = panic,
 }
 
-print("[rivals-owl] v12 loaded - menu: " .. Cfg.menuKey.Name
+print("[rivals-owl] v14 loaded - menu: " .. Cfg.menuKey.Name
     .. " | tabs: " .. tostring(#TabOrder)
     .. " | drawing: " .. tostring(DRAW_SUPPORTED)
     .. " | hook: " .. tostring(HOOK_SUPPORTED))
